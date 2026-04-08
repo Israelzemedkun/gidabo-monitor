@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { MapContainer, TileLayer, CircleMarker, useMapEvents, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
@@ -118,6 +118,18 @@ function computeAvgFromSlot(ids, drawnItems, gridPoints) {
 }
 
 // Leaflet-draw polygon/rectangle toolbar
+function getLayerCentroid(layer) {
+  if (layer instanceof L.Rectangle) {
+    const c = layer.getBounds().getCenter();
+    return { lat: c.lat, lng: c.lng };
+  }
+  const raw = layer.getLatLngs()[0];
+  const ring = Array.isArray(raw[0]) ? raw[0] : raw;
+  const lat = ring.reduce((s, p) => s + p.lat, 0) / ring.length;
+  const lng = ring.reduce((s, p) => s + p.lng, 0) / ring.length;
+  return { lat, lng };
+}
+
 function DrawControl({
   gridPoints,
   onLocationSelect,
@@ -128,6 +140,7 @@ function DrawControl({
   comparisonLocation,
   onDeleteA,
   onDeleteB,
+  setPinCentroids,
 }) {
   const map = useMap();
 
@@ -137,11 +150,13 @@ function DrawControl({
   const onLocationSelectRef   = useRef(onLocationSelect);
   const onDeleteARef          = useRef(onDeleteA);
   const onDeleteBRef          = useRef(onDeleteB);
+  const setPinCentroidsRef    = useRef(setPinCentroids);
   useEffect(() => { comparisonModeRef.current     = comparisonMode;     }, [comparisonMode]);
   useEffect(() => { onComparisonSelectRef.current = onComparisonSelect; }, [onComparisonSelect]);
   useEffect(() => { onLocationSelectRef.current   = onLocationSelect;   }, [onLocationSelect]);
   useEffect(() => { onDeleteARef.current          = onDeleteA;          }, [onDeleteA]);
   useEffect(() => { onDeleteBRef.current          = onDeleteB;          }, [onDeleteB]);
+  useEffect(() => { setPinCentroidsRef.current    = setPinCentroids;    }, [setPinCentroids]);
 
   // Each slot holds a Set of _leaflet_ids for all its drawn polygon layers.
   const drawnLayerAIdsRef = useRef(new Set());
@@ -158,6 +173,7 @@ function DrawControl({
           if (layer) drawnItemsRef.current.removeLayer(layer);
         }
         drawnLayerAIdsRef.current = new Set();
+        setPinCentroidsRef.current(prev => prev.filter(p => p.slot !== 'A'));
       }
     }
   }, [selectedLocation]);
@@ -171,6 +187,7 @@ function DrawControl({
           if (layer) drawnItemsRef.current.removeLayer(layer);
         }
         drawnLayerBIdsRef.current = new Set();
+        setPinCentroidsRef.current(prev => prev.filter(p => p.slot !== 'B'));
       }
     }
   }, [comparisonLocation]);
@@ -207,11 +224,17 @@ function DrawControl({
       if (e.layerType !== 'polygon' && e.layerType !== 'rectangle') return;
 
       const isComparison = comparisonModeRef.current;
+      const slot = isComparison ? 'B' : 'A';
       const ids = isComparison ? drawnLayerBIdsRef.current : drawnLayerAIdsRef.current;
 
       // Add the new layer to drawnItems (visible + editable) and record its ID.
       drawnItems.addLayer(e.layer);
-      ids.add(e.layer._leaflet_id);
+      const id = e.layer._leaflet_id;
+      ids.add(id);
+
+      // Register centroid pin for this polygon.
+      const centroid = getLayerCentroid(e.layer);
+      setPinCentroidsRef.current(prev => [...prev, { ...centroid, slot, id }]);
 
       const result = computeAvgFromSlot(ids, drawnItems, gridPoints);
       if (!result) return;
@@ -233,6 +256,11 @@ function DrawControl({
         const id = layer._leaflet_id;
         if (drawnLayerAIdsRef.current.has(id)) needsUpdateA = true;
         if (drawnLayerBIdsRef.current.has(id)) needsUpdateB = true;
+        // Update centroid for this layer in state.
+        const centroid = getLayerCentroid(layer);
+        setPinCentroidsRef.current(prev =>
+          prev.map(p => p.id === id ? { ...p, ...centroid } : p)
+        );
       });
 
       if (needsUpdateA) {
@@ -262,6 +290,7 @@ function DrawControl({
           drawnLayerBIdsRef.current.delete(id);
           needsUpdateB = true;
         }
+        setPinCentroidsRef.current(prev => prev.filter(p => p.id !== id));
       });
 
       if (needsUpdateA) {
@@ -304,8 +333,9 @@ function DrawControl({
       drawnLayerAIdsRef.current = new Set();
       drawnLayerBIdsRef.current = new Set();
       isDrawingRef.current      = false;
+      setPinCentroidsRef.current([]);
     };
-  }, [map, gridPoints]); // intentionally excludes callbacks — all read via refs
+  }, [map, gridPoints, isDrawingRef]); // intentionally excludes callbacks — all read via refs
 
   return null;
 }
@@ -339,6 +369,9 @@ export default function Map({
   // Shared ref: DrawControl sets true on draw:drawstart, false on draw:drawstop.
   // ClickHandler reads it to suppress map clicks that are actually vertex placements.
   const isDrawingRef = useRef(false);
+
+  // Individual centroid pins for every drawn polygon, keyed by layer id.
+  const [pinCentroids, setPinCentroids] = useState([]);
 
   const pinColor = RISK_COLORS[riskLevel] || RISK_COLORS.none;
   const compPinColor = RISK_COLORS[comparisonRiskLevel] || '#3b82f6';
@@ -374,11 +407,12 @@ export default function Map({
             comparisonLocation={comparisonLocation}
             onDeleteA={onDeleteA}
             onDeleteB={onDeleteB}
+            setPinCentroids={setPinCentroids}
           />
         )}
 
-        {/* Primary location pin (Improvement 1) */}
-        {selectedLocation && (
+        {/* Primary location pin — single click only */}
+        {selectedLocation && !selectedLocation.polygonData && (
           <CircleMarker
             center={[selectedLocation.lat, selectedLocation.lon]}
             radius={14}
@@ -390,8 +424,8 @@ export default function Map({
           />
         )}
 
-        {/* Comparison pin — blue (Improvement 5) */}
-        {comparisonLocation && (
+        {/* Comparison pin — single click only */}
+        {comparisonLocation && !comparisonLocation.polygonData && (
           <CircleMarker
             center={[comparisonLocation.lat, comparisonLocation.lon]}
             radius={14}
@@ -402,6 +436,34 @@ export default function Map({
             className="pin-pulse pin-pulse--b"
           />
         )}
+
+        {/* Individual centroid pins for each drawn polygon (Location A) */}
+        {pinCentroids.filter(p => p.slot === 'A').map(p => (
+          <CircleMarker
+            key={p.id}
+            center={[p.lat, p.lng]}
+            radius={10}
+            fillColor={pinColor}
+            fillOpacity={0.9}
+            weight={2}
+            color="white"
+            className="pin-pulse"
+          />
+        ))}
+
+        {/* Individual centroid pins for each drawn polygon (Location B) */}
+        {pinCentroids.filter(p => p.slot === 'B').map(p => (
+          <CircleMarker
+            key={p.id}
+            center={[p.lat, p.lng]}
+            radius={10}
+            fillColor={compPinColor}
+            fillOpacity={0.9}
+            weight={2}
+            color="white"
+            className="pin-pulse pin-pulse--b"
+          />
+        ))}
       </MapContainer>
 
       {instructionText && (
